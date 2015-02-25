@@ -1,0 +1,517 @@
+var fs = require('fs'),
+    glob = require('glob'),
+    path = require('path'),
+    winston = require('winston'),
+    exists = fs.existsSync || path.existsSync,
+    pkg = require('../package.json'),
+    program = require('commander'),
+    utils = require('../lib/utils'),
+    tint = require('../lib/tint'),
+    Yadda = require('yadda'),
+    chokidar = require('chokidar'),
+    Runner = require('../runner/Runner');
+
+var stdin = process.stdin,
+    stdout = process.stdout,
+    prompt = '\u203A',
+    runner;
+
+program
+    .version(pkg.version)
+    .description(pkg.description);
+
+var cmd = require('../lib/help')(program);
+
+/*
+ * GLOBALS
+ */
+
+var reruns = [],
+    logger,
+    runner;
+
+/**
+ * scan for files at the given `path`.
+ */
+function scanFiles(target) {
+    var files = [];
+    if (exists(target)) {
+        files = glob.sync(target + '/**/*.{feature,coffee,js}');
+    } else {
+        logger.warn('[command] cannot resolve path (or pattern) "' + target + '"');
+    }
+    return files;
+    
+}
+
+/*
+ * filter through a list of files using optional match patterns
+ */
+function filterFiles(files, params) {
+
+    var re = new RegExp(params.match || '');
+    var inv = !!params.matchInvert,
+        featureFiles = [],
+        stepFiles = [],
+        sourceFiles = [],
+        ignore = ['reports', 'coverage', 'node_modules', 'bower_components', '.svn', '.git'];
+
+    var English = Yadda.localisation.English,
+        parser = new Yadda.parsers.FeatureFileParser(English);
+
+    // exclude dynamically temporary folders that Dwarf Cucumber is known to generate
+    function isIgnored(path) {
+        var ignored = false;
+        for(var i = 0, len = ignore.length; i < len; i++) {
+            if(~path.indexOf(ignore[i])) {
+                ignored = true;
+                break;
+            }
+        }
+        return ignored;
+    }
+    function hasTags(feature, tags) {
+        var status = false,
+            annotations = feature.annotations;
+        (tags||[]).every(function(tag) {
+            if(annotations[tag]) {
+                status = true;
+                return false;
+            }
+            return true;
+        });
+        return status;
+    }
+    
+    function filterByTags(file, params) {
+        if((!params.tags || params.tags.length === 0) && (!params.excludeTags || params.excludeTags.length === 0)) {
+            return true;
+        }
+        var feature = parser.parse(file);
+        if((!params.tags || hasTags(feature, params.tags)) && (!params.excludeTags || !hasTags(feature, params.excludeTags))) {
+            return true;
+        }
+        return false;
+    }
+
+    function filterByPattern(file, re, inv) {
+        var match = re.test(file);
+        return match && !inv || !match && inv;        
+    }
+    
+    function isFeature(file) {
+        var ext = path.extname(file).substr(1);
+        return ~['feature', 'spec', 'specification'].indexOf(ext);
+    }
+
+    function isRerun(file) {
+        return !reruns.length || reruns.indexOf(path.join(process.cwd(), file)) > -1;
+    }
+
+    // load reruns if any
+    if(params.rerun) {
+        var rerunFile = path.join(process.cwd(), 'failed.dat');
+
+        if(exists(rerunFile)) {
+            reruns = fs.readFileSync(rerunFile).toString().trim();
+            reruns = reruns ? reruns.split('\n') : [];
+        } else {
+            logger.debug('[command] rerun file %s not found', rerunFile);
+        }
+    }
+    
+    files.forEach(function(file) {
+        if(!isIgnored(file)) {
+            // filter by match pattern, tag annotations and reruns
+            if(isFeature(file) && filterByPattern(file, re, inv) && filterByTags(file, params) && isRerun(file)) {
+                featureFiles.push(file);
+            } else if(/(-step|Step)s?\./.test(path.basename(file))){
+                stepFiles.push(file);
+            } else {
+                sourceFiles.push(file);
+            }
+        }
+    });
+    
+    return {
+        featureFiles: featureFiles,
+        stepFiles: stepFiles,
+        sourceFiles: sourceFiles
+    };
+
+}
+
+/*
+ * scan and filter through passed file paths to retrieve tests.
+ */
+function getTestFiles(args, options) {
+
+    // default files to ./**/*.{feature,js,coffee}
+    var files = [];
+    args = args.length > 0 ? args : ['.'];
+    args.forEach(function(arg){
+       files = files.concat(scanFiles(arg));
+    });
+    // process exclusions and filtering
+    return filterFiles(files, options);
+
+}
+
+function getLogger(config) {
+    var isatty = require('tty').isatty(process.stdout.fd),
+        levels = {
+            debug: 1,
+            info: 2,
+            warn: 3,
+            error: 4
+        },
+        colors = {
+            info: 'cyan',
+            debug: 'grey',
+            warn: 'yellow',
+            error: 'red'
+        };
+    var options = {
+        console: utils.apply({
+            //handleExceptions: true,
+            json: false,
+            level: 'error',
+            colorize:  isatty, /* patch: do not colorize file and pipe output */
+            exitOnError: false
+        }, options)
+    };
+
+    if (config.log) {
+        options.file = {
+            filename: config.log,
+            level: 'debug',
+            json: false
+        };
+    }
+
+    // share logger config
+    winston.addColors(colors);
+    winston.loggers.add('dc', options);
+
+    var logger = winston.loggers.get('dc');
+    logger.setLevels(levels);
+
+    if (config.debug) {
+        logger.transports.console.level = 'debug';
+        logger.debug('[dc] debug logging is ON');
+    }
+    return logger;
+}
+
+function loadConfig(file, runner, cb) {
+
+    if(!file) {
+        // no external config
+        return cb(null, null);
+    }
+    
+    file = path.join(process.cwd(), file);
+    if(path.basename(file).match(/.(js|coffee)$/)) {
+        delete require.cache[file];
+        var config = require(file);
+        config(runner);
+        return cb(null);
+    }
+
+    if(path.basename(file).match(/.(json|conf)$/)) {
+        // json config file
+        fs.readFile(file, function(err, config) {
+            try {
+                config = JSON.parse(config);
+                runner.setConfig(config);
+                return cb(null);
+            } catch(e) {
+                console.error('Error parsing config file:', file);
+                console.error(e.message);
+                // return cb(e);
+                process.exit(1);
+            }
+        });
+        return;
+    }
+    
+    console.error('Unsupported config file:', file);
+    // return cb(new Error('Unsupported config file:' + file));
+    process.exit(1);
+
+}
+/**
+ * merge external config file with inline config. Inline config overrides external config
+ */
+function mergeConfig(externalConfig) {
+
+    var config = externalConfig || {};
+    // Fetch test files and apply file pattern filtering
+    var targets = program.args.slice(0, -1);
+    targets = targets.length > 0 ? targets : ['.'];
+
+    var files = getTestFiles(targets, utils.copyTo({}, program, 'match,matchInvert,tags,excludeTags,rerun'));
+    logger.debug('[command] matching files', files);
+
+    utils.apply(utils.copyTo(config, program, 'browsers,timeout,slow,debug,failfast,tunnel,port,testStrategy,reporters,reportPath,shareSession,match,matchInvert,tags,excludeTags,rerun,watchDelay'), {
+        featureFiles: files.featureFiles,
+        stepFiles: files.stepFiles,
+        sourceFiles: files.sourceFiles
+    });
+    logger.debug('[command] configuration', config);
+    return config;
+
+}
+
+function runTests(options) {
+
+    // If runTests() is invoked over an already active session, then abort current execution first then start a new one.
+    if(runner && runner.state === 'started') {
+        runner.abort(function() {
+            runTests(options);
+        });
+        return;
+    }
+
+    function onRunComplete (stats) {
+        // record failed tests for use with the next command if --rerun is enabled
+        var recordFile = path.join(process.cwd(), 'failed.dat'),
+            output = [];
+        if(stats.failures > 0) {
+            utils.each(stats.results, function(result) {
+                if(result.stats.failures > 0) {
+                    output.push(path.join(process.cwd(), result.feature.file));
+                }
+            });
+        }
+        fs.writeFileSync(recordFile, output.join('\n'));
+        
+        // don't exit if we're in watch mode
+        if(options && !options.watch) {
+            /*
+                Exit with the following status codes:
+                0 if testing was completed and all tests passed.
+                1 if testing was completed but some tests failed.
+            */
+            var exitCode = (stats.failures > 0) ? 1 : 0;
+            process.exit(exitCode);
+        }
+    }
+    // Execute the runner
+    runner.run(onRunComplete);
+
+}
+
+function generateSteps(file) {
+
+    var StepDefinitionGenerator = require('../lib/StepDefinitionGenerator'),
+        generator = new StepDefinitionGenerator();
+    // clear the console
+    process.stdout.write('\u001B[2J');
+    // Move the cursor to the top
+    process.stdout.write('\u001B[f');
+    printLogo();
+    
+    fs.exists(file, function(exists) {
+        if(!exists) {
+            logger.debug('[command] Could not locate the file "' + file + '"');
+            return console.error('[command] Could not locate the file "' + file + '"');
+        }
+        generator.prompt(file, function(data) {
+            // display output only. no saving of output to file
+            if(!data.target) {
+                return doGenerateSteps(generator, file, data);
+            }
+            // check if target file exists and get confirmation to overwrite.
+            fs.exists(file, function(exists) {
+                if(!exists) {
+                    // target file doesn't exist. proceed to save.
+                    return doGenerateSteps(generator, file, data);
+                }
+                utils.question('The target file "' + file + '" already exists. Do you want to replace it?', {
+                    stdin: stdin,
+                    stdout: stdout,
+                    prompt: prompt
+                }, function(answer) {
+                    process.stdout.write('\u001B[1A  ' + prompt + ' \u001B[K');
+                    if(~['y', 'yes'].indexOf(answer.toLowerCase())) {
+                        console.log(tint.green('yes') + '\n');
+                        // user wants to overwrite existing file. Let's proceed
+                        return doGenerateSteps(generator, file, data);
+                    }
+                    console.log(tint.green('no') + '\n\nok, operation aborted.\n');
+                    process.exit();
+                });
+            });
+        });
+    });
+
+}
+
+function doGenerateSteps(generator, file, data) {
+
+    generator.generateFromFile(file, data.language, data.type, data.target, function(err, output) {
+        if(err) {
+            logger.debug('[command] Could not generate step definitions.', err.message);
+            console.error('[command] Could not generate step definitions.', err.message);
+        } else if(!data.target) {
+            console.log(tint.gray('Output:\n'));
+            console.log(output);
+        }
+        process.exit();
+    });
+
+}
+
+
+function watch() {
+
+    // clear the console
+    process.stdout.write('\u001B[2J');
+    // Move the cursor to the top
+    process.stdout.write('\u001B[f');
+    printLogo();
+    console.log('Watching for changes, press', tint.gray('Ctrl+C'), 'to exit');
+
+    var fn = function(target) {
+        function fmt(n) {
+            // Format integers to have a leading zero.
+            return n < 10 ? '0' + n : n;
+        }
+        var date = new Date(),
+            time = fmt(date.getHours()) + ":" + fmt(date.getMinutes()) + ":" + fmt(date.getSeconds());
+        console.info(tint.gray('\nChange detected at ' + time + ' in'), path.basename(target));
+        console.log();
+        
+        // instantiate a new runner instance
+        runner = new Runner();
+
+        // Process configuration    
+        loadConfig(program.config, runner, function(err) {
+            if(err) {
+                return;
+            }
+            var config = mergeConfig(runner.getConfig());
+            runner.setConfig(config);
+            runTests({ watch: true });
+        });
+
+    };
+
+    // add buffer delay to reduce massive triggering of test runs on file changes
+    var cmd = program.args.slice(-1)[0];
+    fn = buffer(fn, cmd.watchDelay);
+
+    var targets = program.args.slice(0, -1);
+    targets = targets.length > 0 ? targets : ['.'];
+
+    var watcher = chokidar.watch(targets, { 
+        ignored: /[\/\\]\./, 
+        persistent: true,
+        ignoreInitial: true
+    });
+
+    utils.each(['add', 'addDir', 'change', 'unlink'], function(event) {
+        watcher.on(event, fn);
+    });
+
+}
+
+function buffer(fn, ms, scope) {
+    var id;
+    return function() {
+           clearTimeout(id);
+           var args = arguments;
+           id = setTimeout(function() {
+               fn.apply(scope||this, args);
+               id = null;
+             }, ms);
+    };
+}
+
+function processCommand(cmd) {
+
+    if(cmd.action === 'run') {
+
+        logger.info('[command] execute "run" mode');
+        printLogo();
+
+        // instantiate a new runner instance
+        runner = new Runner();
+
+        // Process configuration    
+        loadConfig(program.config, runner, function(err) {
+            if(err) {
+                return;
+            }
+            var config = mergeConfig(runner.getConfig());
+            runner.setConfig(config);
+            runTests();
+        });
+
+    } else if(cmd.action === 'watch') {
+        logger.info('[command] execute "watch" mode');
+
+        watch();
+
+    } else if(cmd.action === 'web') {
+
+        logger.info('[command] execute "web" mode');
+        printLogo();
+
+    } else if(cmd.action === 'generate') {
+
+        logger.info('[command] execute "generate" mode');
+
+        if(!cmd.file) {
+            printLogo();
+            console.error('  The "generate" command requires a file <path>.');
+            console.error('  --------------------------------');
+            cmd.cmd.help();
+            return;
+        }
+        generateSteps(cmd.file);
+
+    } else {
+
+        printLogo();
+        console.error('  No command specified.');
+        console.error('  ---------------------');
+        program.help();
+
+    }
+}
+function printLogo() {
+    console.log(["",
+"    _                  __  ",          
+" __| |_ __ ____ _ _ _ / _| ",          
+"/ _` \ V  V / _` | '_|  _| ",          
+"\__,_|\_/\_/\__,_|_| |_|   ",          
+" __ _  _ __ _  _ _ __ | |__  ___ _ _   ",
+"/ _| || / _| || | '  \| '_ \/ -_) '_|  ",
+"\__|\_,_\__|\_,_|_|_|_|_.__/\___|_|    ",
+                                      
+    ""].join('\n'));
+}
+
+/*
+ * INITIALIZATION
+ */
+
+// parse args
+program.parse(process.argv);
+// Init logger
+logger = getLogger(utils.copyTo({}, program, 'debug,log'));
+
+// perform graceful shutdown on Ctrl+C
+process.on('SIGINT', function () {
+    if(runner) {
+        runner.abort(function() {
+            process.exit(runner.stats.failures > 0 ? 1 : 0);
+        });
+    } else {
+        process.exit(0);
+    }
+});
+
+processCommand(cmd);
