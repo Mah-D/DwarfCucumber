@@ -138,7 +138,7 @@ Then(/I should see a welcome page/, function(done) {
 It's all done! rn `dc.js`  from the `tests` directory.
 
 ```
-node ../bin/dc.js run
+node ./bin/dc.js run
 ```
 
 If you do everything right accordingly, you must get the following colored output in terminal:
