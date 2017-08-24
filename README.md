@@ -7,7 +7,7 @@ Requirements:
 [Yadda](https://github.com/acuminous/yadda): Advanced BDD and Gherkin Given/When/Then  parser.
 [Chai](http://chaijs.com): Assertion library. 
 [Selenium](http://docs.seleniumhq.org/projects/webdriver/): Webdriver based browser automation.
-[Mocha](http://visionmedia.github.io/mocha/): BDD Testing framework.  
+[Mocha](http://mochajs.org/): BDD Testing framework.  
 
 ## Example
 
